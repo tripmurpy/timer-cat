@@ -1,0 +1,7 @@
+desain.md
+AGENTS.md
+agents.md
+brain/
+
+__pycache__/
+*.pyc
