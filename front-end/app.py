@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover - fallback non-Windows
 
 
 MAX_MS = 85 * 60 * 1000
+JUMP_SECONDS = .7
 
 
 class Timer:
@@ -77,14 +78,17 @@ class CuteTimerApp:
         self.feedback_until = 0.0
         self.feedback_text = ""
         self.gesture_job = None
-        self.wheel_active = False
         self.last_second = None
         self.cat_frame = 0
         self.animation_started = time.monotonic()
-        pet_dir = Path(__file__).resolve().parent.parent / "desain" / "pets"
+        self.jump_started = 0.0
+        pet_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "desain" / "pets"
         self.cat_images_full = [tk.PhotoImage(file=pet_dir / f"frame-{i:02}.png") for i in range(1, 5)]
         self.cat_images_small = [image.subsample(2) for image in self.cat_images_full]
         self.cat_images_micro = [image.subsample(3) for image in self.cat_images_full]
+        self.cat_pause_full = [tk.PhotoImage(file=pet_dir / f"pause-jump-{i:02}.png") for i in range(1, 3)]
+        self.cat_pause_small = [image.subsample(2) for image in self.cat_pause_full]
+        self.cat_pause_micro = [image.subsample(3) for image in self.cat_pause_full]
 
         root.title("Cute Timer")
         root.configure(bg=self.BG)
@@ -198,7 +202,7 @@ class CuteTimerApp:
         self.gesture_job = None
         if self.timer.running:
             self._show_feedback("STOP")
-            self.pause(wheel=True)
+            self.pause()
         else:
             self._show_feedback("PLAY")
             self.start()
@@ -240,17 +244,19 @@ class CuteTimerApp:
         self.root.geometry("240x52")
 
     def start(self):
-        self.wheel_active = False
+        was_paused = self._paused()
         self.timer.start()
+        if was_paused and self.timer.running:
+            self.jump_started = time.monotonic()
         self._refresh_text()
 
-    def pause(self, wheel=False):
-        self.wheel_active = wheel
+    def pause(self):
+        if self.timer.running:
+            self.jump_started = time.monotonic()
         self.timer.pause()
         self._refresh_text()
 
     def reset(self):
-        self.wheel_active = False
         self.timer.reset()
         self.finish_until = 0
         self._refresh_text()
@@ -337,7 +343,10 @@ class CuteTimerApp:
         canvas.create_image(x, 0, image=cat, anchor="nw", tags="walking-cat")
 
     def _wheel_size(self, canvas):
-        return 36 if canvas is self.display_micro else 64 if canvas is self.display_small and self.wheel_active else 0
+        return 36 if canvas is self.display_micro else 64 if canvas is self.display_small and self._paused() else 0
+
+    def _paused(self):
+        return not self.timer.running and self.timer.value() > 0
 
     def _draw_wheel(self, canvas):
         diameter = self._wheel_size(canvas)
@@ -345,13 +354,29 @@ class CuteTimerApp:
         cx, cy = canvas.winfo_width() - radius - 3, canvas.winfo_height() / 2
         canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
                            outline=self.PINK, width=2, tags="cat-wheel")
-        rotation = (time.monotonic() - self.animation_started) * 180
+        now = time.monotonic()
+        elapsed = now - self.animation_started
+        jump_elapsed = now - self.jump_started
+        jumping = 0 <= jump_elapsed < JUMP_SECONDS
+        rotation = elapsed * 180 if self.timer.running and not jumping else 0
         for angle in range(0, 360, 60):
             dx = math.cos(math.radians(angle + rotation)) * (radius - 3)
             dy = math.sin(math.radians(angle + rotation)) * (radius - 3)
             canvas.create_line(cx, cy, cx + dx, cy + dy, fill=self.PURPLE, width=1, tags="wheel-spoke")
-        images = self.cat_images_micro if canvas is self.display_micro else self.cat_images_small
-        canvas.create_image(cx, cy, image=images[self.cat_frame], tags="walking-cat")
+        if jumping:
+            progress = jump_elapsed / JUMP_SECONDS
+            hop = 4 * progress * (1 - progress)
+            images = self.cat_pause_micro if canvas is self.display_micro else self.cat_pause_small
+            cat = images[1 if .1 < progress < .9 else 0]
+            y = cy - hop * (10 if canvas is self.display_micro else 20)
+        elif self._paused():
+            images = self.cat_pause_micro if canvas is self.display_micro else self.cat_pause_small
+            cat, y = images[0], cy
+        else:
+            images = self.cat_images_micro if canvas is self.display_micro else self.cat_images_small
+            cat = images[self.cat_frame] if self.timer.running else images[0]
+            y = cy
+        canvas.create_image(cx, y, image=cat, tags="walking-cat")
 
     def _draw_feedback(self, canvas):
         progress = 1 - max(0, self.feedback_until - time.monotonic()) / 1.2
@@ -411,9 +436,10 @@ class CuteTimerApp:
     def _update(self):
         if self.timer.tick():
             self._finish()
+        now = time.monotonic()
         second = math.ceil(self.timer.value() / 1000)
-        frame = int((time.monotonic() - self.animation_started) * 8) % 4
-        if second != self.last_second or frame != self.cat_frame:
+        frame = int((now - self.animation_started) * 8) % 4
+        if second != self.last_second or frame != self.cat_frame or self._paused() or 0 <= now - self.jump_started < JUMP_SECONDS:
             self.last_second, self.cat_frame = second, frame
             self._refresh_text()
         elif time.monotonic() < self.finish_until:
@@ -476,11 +502,20 @@ def ui_self_test():
     assert app.timer.value() == 600_000
     controls["▶ START\n(spasi)"].invoke()
     assert app.timer.running
+    running_phase = app.animation_started
     controls["Ⅱ PAUSE\n(p)"].invoke()
     assert not app.timer.running
+    assert app.animation_started == running_phase
+    pause_phase = app.jump_started
+    controls["Ⅱ PAUSE\n(p)"].invoke()
+    assert app.jump_started == pause_phase
+    controls["▶ START\n(spasi)"].invoke()
+    assert app.timer.running and app.animation_started == running_phase and app.jump_started >= pause_phase
     controls["↻ RESET\n(r)"].invoke()
-    assert app.timer.value() == 0
+    assert app.timer.value() == 0 and not app._paused()
+    app.jump_started = 0
     controls["＋15 MENIT"].invoke()
+    assert app._paused() and app.jump_started == 0
     controls["＋20 MENIT"].invoke()
     assert app.timer.value() == 2_100_000
     assert "MENIT   :   DETIK" in label_texts(root)
@@ -493,6 +528,7 @@ def ui_self_test():
     app.set_compact(False)
     root.update()
     app._draw_time()
+    assert not app.display_full.find_withtag("cat-wheel")
     assert len(app.cat_images_full) == len(app.cat_images_small) == len(app.cat_images_micro) == 4
     assert (app.cat_images_full[0].width(), app.cat_images_full[0].height()) == (84, 56)
     assert (app.cat_images_small[0].width(), app.cat_images_small[0].height()) == (42, 28)
@@ -507,11 +543,25 @@ def ui_self_test():
     assert bool(root.attributes("-topmost"))
     assert (root.winfo_width(), root.winfo_height()) == (480, 105)
     assert not buttons(app.small)
+    app.jump_started = time.monotonic() - .35
     app._draw_time()
     assert app.display_small.find_withtag("walking-cat")
+    assert app.display_small.find_withtag("cat-wheel")
+    jumping_cat = app.display_small.find_withtag("walking-cat")[0]
+    wheel_center_y = sum(app.display_small.bbox("cat-wheel")[1::2]) / 2
+    assert app.display_small.itemcget(jumping_cat, "image") == str(app.cat_pause_small[1])
+    assert wheel_center_y - app.display_small.coords(jumping_cat)[1] >= 18
+    paused_spoke = app.display_small.coords(app.display_small.find_withtag("wheel-spoke")[0])
+    app.jump_started = time.monotonic() - 1.75
+    app._draw_time()
+    stopped_cat = app.display_small.find_withtag("walking-cat")[0]
+    assert app.display_small.itemcget(stopped_cat, "image") == str(app.cat_pause_small[0])
+    assert abs(app.display_small.coords(stopped_cat)[1] - wheel_center_y) <= 1
+    assert app.display_small.coords(app.display_small.find_withtag("wheel-spoke")[0]) == paused_spoke
     app._seven_segment(app.display_small, "35:00")
     timer_bbox = app.display_small.bbox("all")
-    assert abs((timer_bbox[0] + timer_bbox[2]) / 2 - app.display_small.winfo_width() / 2) <= 2
+    timer_area_width = app.display_small.winfo_width() - app._wheel_size(app.display_small) - 8
+    assert abs((timer_bbox[0] + timer_bbox[2]) / 2 - timer_area_width / 2) <= 3
     controls["▣ MICRO"].invoke()
     root.update()
     timer_area_width = app.display_micro.winfo_width() - app._wheel_size(app.display_micro) - 8
@@ -525,7 +575,7 @@ def ui_self_test():
     assert app.display_micro.find_withtag("cat-wheel")
     assert bool(root.attributes("-topmost")) and app.display_micro.find_withtag("walking-cat")
     assert app.display_micro.bbox("all")[3] < app.display_micro.winfo_height()
-    app.animation_started = time.monotonic()
+    app.jump_started = time.monotonic() - .35
     app._seven_segment(app.display_micro, "35:00")
     timer_bbox = app.display_micro.bbox("all")
     app._draw_wheel(app.display_micro)
@@ -534,12 +584,34 @@ def ui_self_test():
     wheel_bbox = app.display_micro.bbox("cat-wheel")
     first_spoke = app.display_micro.coords(app.display_micro.find_withtag("wheel-spoke")[0])
     assert timer_bbox[2] < wheel_bbox[0] and wheel_bbox[0] < cat_bbox[0] < cat_bbox[2] < wheel_bbox[2]
-    app.animation_started -= .5
+    wheel_center_y = sum(wheel_bbox[1::2]) / 2
+    assert app.display_micro.itemcget(cat_id, "image") == str(app.cat_pause_micro[1])
+    assert wheel_center_y - app.display_micro.coords(cat_id)[1] >= 9
+    app.jump_started = time.monotonic() - 1.75
     app._seven_segment(app.display_micro, "35:00")
     app._draw_wheel(app.display_micro)
     second_spoke = app.display_micro.coords(app.display_micro.find_withtag("wheel-spoke")[0])
-    assert second_spoke != first_spoke
+    cat_id = app.display_micro.find_withtag("walking-cat")[0]
+    assert second_spoke == first_spoke and app.display_micro.itemcget(cat_id, "image") == str(app.cat_pause_micro[0])
+    assert abs(app.display_micro.coords(cat_id)[1] - wheel_center_y) <= 1
     app.start()
+    app.jump_started = time.monotonic() - .35
+    app._seven_segment(app.display_micro, "35:00")
+    app._draw_wheel(app.display_micro)
+    resume_cat = app.display_micro.find_withtag("walking-cat")[0]
+    resume_spoke = app.display_micro.coords(app.display_micro.find_withtag("wheel-spoke")[0])
+    assert app.display_micro.itemcget(resume_cat, "image") == str(app.cat_pause_micro[1])
+    assert wheel_center_y - app.display_micro.coords(resume_cat)[1] >= 9
+    assert resume_spoke == first_spoke
+    app.jump_started = time.monotonic() - .8
+    app.animation_started = time.monotonic()
+    app._seven_segment(app.display_micro, "35:00")
+    app._draw_wheel(app.display_micro)
+    first_spoke = app.display_micro.coords(app.display_micro.find_withtag("wheel-spoke")[0])
+    app.animation_started -= .5
+    app._seven_segment(app.display_micro, "35:00")
+    app._draw_wheel(app.display_micro)
+    assert app.display_micro.coords(app.display_micro.find_withtag("wheel-spoke")[0]) != first_spoke
     click(app.display_micro, 2)
     root.after(300, root.quit)
     root.mainloop()
